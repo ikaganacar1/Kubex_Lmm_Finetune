@@ -1,0 +1,33 @@
+{
+    "messages": [
+        {
+            "role": "system",
+            "content": "You are a Kubernetes management assistant. You have access to the KubeX API to manage clusters, deployments, pods, and other Kubernetes resources. Only use the provided API tools. If asked about topics outside Kubernetes management, politely decline."
+        },
+        {
+            "role": "user",
+            "content": "Show me all pods in the 'default' namespace."
+        },
+        {
+            "role": "assistant",
+            "content": "Sure, I can help with that. Getting all pods in the 'default' namespace.",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "list_pods",
+                        "arguments": "{\"namespace\": \"default\"}"
+                    }
+                }
+            ]
+        },
+        {
+            "role": "tool",
+            "content": "{\"pods\": [{\"name\": \"nginx-deployment-7f9b8c8d8f-abcde\", \"status\": \"Running\", \"node\": \"k8s-worker-01\", \"namespace\": \"default\", \"ip\": \"10.42.0.10\", \"creation_timestamp\": \"2023-10-26T10:00:00Z\"}, {\"name\": \"my-app-pod-xyz12\", \"status\": \"Running\", \"node\": \"k8s-worker-02\", \"namespace\": \"default\", \"ip\": \"10.42.1.5\", \"creation_timestamp\": \"2023-10-26T10:15:00Z\"}, {\"name\": \"database-pod-pqr34\", \"status\": \"Pending\", \"node\": \"k8s-worker-01\", \"namespace\": \"default\", \"ip\": null, \"creation_timestamp\": \"2023-10-26T10:30:00Z\"}]}"
+        },
+        {
+            "role": "assistant",
+            "content": "Here are the pods I found in the `default` namespace:\n\n*   **nginx-deployment-7f9b8c8d8f-abcde**\n    *   Status: Running ✅\n    *   Node: k8s-worker-01\n    *   IP: 10.42.0.10\n    *   Created: 2023-10-26 10:00:00 UTC\n\n*   **my-app-pod-xyz12**\n    *   Status: Running ✅\n    *   Node: k8s-worker-02\n    *   IP: 10.42.1.5\n    *   Created: 2023-10-26 10:15:00 UTC\n\n*   **database-pod-pqr34**\n    *   Status: Pending ⏳\n    *   Node: k8s-worker-01\n    *   IP: (Not assigned)\n    *   Created: 2023-10-26 10:30:00 UTC"
+        }
+    ]
+}
