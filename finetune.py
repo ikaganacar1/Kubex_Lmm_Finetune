@@ -1,601 +1,631 @@
 #!/usr/bin/env python3
 """
-Dynamic Fine-tuning script for Qwen3 model using Unsloth
-Configurable via YAML files for different hardware setups and datasets
+Advanced Dynamic Fine-tuning Script with Smart Early Stopping
+Supports YAML configuration and multiple stopping mechanisms
 """
 
 import os
 import gc
 import yaml
 import argparse
+import time
+import signal
+import sys
 import torch
 import traceback
 from pathlib import Path
-from transformers import EarlyStoppingCallback
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
+from dataclasses import dataclass
+
 from unsloth import FastLanguageModel
 from trl import SFTTrainer, SFTConfig
 from datasets import load_dataset
+from transformers import TrainerCallback, TrainerState, TrainerControl
+from transformers.trainer_utils import IntervalStrategy
 
-class FineTuningConfig:
-    """Configuration manager for fine-tuning parameters"""
+
+@dataclass
+class EarlyStopConfig:
+    """Configuration for early stopping mechanisms"""
+    enable_loss_early_stopping: bool = False
+    patience: int = 5
+    min_delta: float = 0.001
+    min_steps: int = 100
+    check_interval: int = 10
+    target_loss: Optional[float] = None
+    max_time_minutes: Optional[int] = None
+    max_steps: Optional[int] = None
+
+
+class SmartEarlyStoppingCallback(TrainerCallback):
+    """Advanced early stopping callback with multiple stop conditions"""
+    
+    def __init__(self, config: EarlyStopConfig):
+        self.config = config
+        self.loss_history: List[float] = []
+        self.best_loss = float('inf')
+        self.patience_count = 0
+        self.start_time = time.time()
+        self.should_stop = False
+        self.stop_reason = ""
+        
+        print("🧠 Smart Early Stopping initialized:")
+        if config.target_loss:
+            print(f"  🎯 Target loss: {config.target_loss}")
+        if config.max_time_minutes:
+            print(f"  ⏰ Max time: {config.max_time_minutes} minutes")
+        if config.enable_loss_early_stopping:
+            print(f"  📉 Loss patience: {config.patience} checks")
+    
+    def on_log(self, args, state: TrainerState, control: TrainerControl, logs=None, **kwargs):
+        """Check stopping conditions on each log"""
+        if logs is None or state.global_step < self.config.min_steps:
+            return
+        
+        current_loss = logs.get('loss', float('inf'))
+        
+        # Check target loss
+        if self._check_target_loss(current_loss, state.global_step):
+            control.should_training_stop = True
+            return
+        
+        # Check time limit
+        if self._check_time_limit():
+            control.should_training_stop = True
+            return
+        
+        # Check max steps
+        if self._check_max_steps(state.global_step):
+            control.should_training_stop = True
+            return
+        
+        # Check loss plateau (only at intervals)
+        if state.global_step % self.config.check_interval == 0:
+            if self._check_loss_plateau(current_loss, state.global_step):
+                control.should_training_stop = True
+                return
+    
+    def _check_target_loss(self, current_loss: float, step: int) -> bool:
+        """Check if target loss is reached"""
+        if self.config.target_loss and current_loss <= self.config.target_loss:
+            self.stop_reason = f"🎯 Target loss {self.config.target_loss} reached! Current: {current_loss:.4f} at step {step}"
+            print(f"\n{self.stop_reason}")
+            return True
+        return False
+    
+    def _check_time_limit(self) -> bool:
+        """Check if time limit is exceeded"""
+        if self.config.max_time_minutes:
+            elapsed_minutes = (time.time() - self.start_time) / 60
+            if elapsed_minutes >= self.config.max_time_minutes:
+                self.stop_reason = f"⏰ Time limit reached: {elapsed_minutes:.1f}/{self.config.max_time_minutes} minutes"
+                print(f"\n{self.stop_reason}")
+                return True
+        return False
+    
+    def _check_max_steps(self, step: int) -> bool:
+        """Check if max steps reached"""
+        if self.config.max_steps and step >= self.config.max_steps:
+            self.stop_reason = f"🔢 Max steps reached: {step}/{self.config.max_steps}"
+            print(f"\n{self.stop_reason}")
+            return True
+        return False
+    
+    def _check_loss_plateau(self, current_loss: float, step: int) -> bool:
+        """Check if loss has plateaued"""
+        if not self.config.enable_loss_early_stopping:
+            return False
+        
+        self.loss_history.append(current_loss)
+        
+        # Keep history manageable
+        if len(self.loss_history) > self.config.patience * 3:
+            self.loss_history = self.loss_history[-self.config.patience * 2:]
+        
+        # Check for improvement
+        if current_loss < (self.best_loss - self.config.min_delta):
+            self.best_loss = current_loss
+            self.patience_count = 0
+            print(f"🔥 New best loss: {current_loss:.4f} at step {step}")
+        else:
+            self.patience_count += 1
+            if self.patience_count % 2 == 0:  # Don't spam logs
+                print(f"⏳ No improvement: {self.patience_count}/{self.config.patience} checks (best: {self.best_loss:.4f})")
+        
+        # Stop if patience exceeded
+        if self.patience_count >= self.config.patience:
+            self.stop_reason = f"📉 Early stopping: No improvement for {self.config.patience} checks (best loss: {self.best_loss:.4f})"
+            print(f"\n{self.stop_reason}")
+            return True
+        
+        return False
+
+
+class GracefulKiller:
+    """Handle Ctrl+C gracefully"""
+    
+    def __init__(self):
+        self.kill_now = False
+        signal.signal(signal.SIGINT, self._exit_gracefully)
+        signal.signal(signal.SIGTERM, self._exit_gracefully)
+    
+    def _exit_gracefully(self, *args):
+        print("\n🛑 Graceful shutdown initiated...")
+        self.kill_now = True
+
+
+class ConfigManager:
+    """Enhanced configuration manager with validation and type conversion"""
     
     def __init__(self, config_path: str):
         self.config_path = config_path
-        self.config = self.load_config()
-        self.validate_config()
-        self.convert_types()
+        self.config = self._load_and_validate()
     
-    def load_config(self) -> Dict[str, Any]:
-        """Load configuration from YAML file"""
+    def _load_and_validate(self) -> Dict[str, Any]:
+        """Load and validate configuration"""
+        if not Path(self.config_path).exists():
+            raise FileNotFoundError(f"Config file not found: {self.config_path}")
+        
         with open(self.config_path, 'r') as f:
-            return yaml.safe_load(f)
+            config = yaml.safe_load(f)
+        
+        # Validate required sections
+        required_sections = ['model', 'training', 'dataset', 'output']
+        missing = [s for s in required_sections if s not in config]
+        if missing:
+            raise ValueError(f"Missing required config sections: {missing}")
+        
+        # Convert and validate types
+        self._convert_types(config)
+        return config
     
-    def convert_types(self):
+    def _convert_types(self, config: Dict[str, Any]):
         """Convert string values to appropriate types"""
-        # Convert common numeric fields that might be strings
-        training = self.config.get('training', {})
+        # Training config type conversions
+        training = config.get('training', {})
+        training_conversions = {
+            'per_device_train_batch_size': int,
+            'gradient_accumulation_steps': int,
+            'num_train_epochs': int,
+            'learning_rate': float,
+            'warmup_ratio': float,
+            'warmup_steps': int,
+            'logging_steps': int,
+            'save_steps': int,
+            'save_total_limit': int,
+            'max_steps': int,
+        }
         
-        # Convert learning rate and other float fields
-        float_fields = ['learning_rate', 'warmup_ratio']
-        for field in float_fields:
-            if field in training and isinstance(training[field], str):
+        for key, type_func in training_conversions.items():
+            if key in training and isinstance(training[key], str):
                 try:
-                    training[field] = float(training[field])
-                except ValueError:
-                    pass
+                    training[key] = type_func(training[key])
+                except (ValueError, TypeError):
+                    print(f"⚠️ Warning: Could not convert {key} to {type_func.__name__}")
         
-        # Convert integer fields
-        int_fields = ['per_device_train_batch_size', 'gradient_accumulation_steps', 
-                     'num_train_epochs', 'logging_steps', 'warmup_steps', 
-                     'save_total_limit', 'save_steps', 'dataset_num_proc']
-        for field in int_fields:
-            if field in training and isinstance(training[field], str):
-                try:
-                    training[field] = int(training[field])
-                except ValueError:
-                    pass
+        # Model config type conversions
+        model = config.get('model', {})
+        if 'max_seq_length' in model and isinstance(model['max_seq_length'], str):
+            try:
+                model['max_seq_length'] = int(model['max_seq_length'])
+            except (ValueError, TypeError):
+                pass
         
-        # Convert model fields
-        model = self.config.get('model', {})
-        model_int_fields = ['max_seq_length']
-        for field in model_int_fields:
-            if field in model and isinstance(model[field], str):
-                try:
-                    model[field] = int(model[field])
-                except ValueError:
-                    pass
-        
-        # Convert LoRA fields
+        # LoRA config type conversions
         lora = model.get('lora', {})
-        lora_int_fields = ['r', 'alpha', 'random_state']
-        lora_float_fields = ['dropout']
-        for field in lora_int_fields:
-            if field in lora and isinstance(lora[field], str):
+        lora_conversions = {
+            'r': int, 'alpha': int, 'dropout': float, 'random_state': int
+        }
+        for key, type_func in lora_conversions.items():
+            if key in lora and isinstance(lora[key], str):
                 try:
-                    lora[field] = int(lora[field])
-                except ValueError:
+                    lora[key] = type_func(lora[key])
+                except (ValueError, TypeError):
                     pass
-        for field in lora_float_fields:
-            if field in lora and isinstance(lora[field], str):
-                try:
-                    lora[field] = float(lora[field])
-                except ValueError:
-                    pass
+
+
+class DatasetManager:
+    """Handle dataset loading and preprocessing"""
     
-    def validate_config(self):
-        """Validate required configuration keys"""
-        required_keys = ['model', 'training', 'dataset', 'hardware', 'output']
-        for key in required_keys:
-            if key not in self.config:
-                raise ValueError(f"Missing required config key: {key}")
+    @staticmethod
+    def format_conversations(examples, format_type: str = "chatml"):
+        """Format conversations for training"""
+        texts = []
+        
+        if format_type == "chatml":
+            for conversation in examples.get("messages", []):
+                text = ""
+                for message in conversation:
+                    role = message.get("role", "user")
+                    content = message.get("content", "")
+                    text += f"<|im_start|>{role}\n{content}<|im_end|>\n"
+                texts.append(text)
+        
+        elif format_type == "alpaca":
+            for conversation in examples.get("messages", []):
+                if len(conversation) >= 2:
+                    instruction = conversation[0].get("content", "")
+                    response = conversation[1].get("content", "")
+                    text = f"### Instruction:\n{instruction}\n\n### Response:\n{response}\n"
+                    texts.append(text)
+        
+        elif format_type == "simple_qa":
+            for item in examples.get("conversations", examples.get("messages", [])):
+                if isinstance(item, dict):
+                    question = item.get("question", item.get("input", ""))
+                    answer = item.get("answer", item.get("output", ""))
+                    text = f"Question: {question}\nAnswer: {answer}\n"
+                    texts.append(text)
+        
+        return {"text": texts}
     
-    def get_model_config(self) -> Dict[str, Any]:
-        return self.config['model']
+    @staticmethod
+    def load_and_prepare_dataset(dataset_config: Dict[str, Any]):
+        """Load and prepare dataset"""
+        dataset_path = dataset_config['path']
+        dataset_format = dataset_config.get('format', 'jsonl')
+        
+        print(f"📚 Loading dataset: {dataset_path}")
+        
+        # Load dataset
+        if dataset_format in ['json', 'jsonl']:
+            dataset = load_dataset("json", data_files=dataset_path)["train"]
+        elif dataset_format == 'csv':
+            dataset = load_dataset("csv", data_files=dataset_path)["train"]
+        else:
+            raise ValueError(f"Unsupported dataset format: {dataset_format}")
+        
+        print(f"📊 Original dataset size: {len(dataset)}")
+        
+        # Format conversations
+        conversation_format = dataset_config.get('conversation_format', 'chatml')
+        dataset = dataset.map(
+            lambda x: DatasetManager.format_conversations(x, conversation_format),
+            batched=True,
+            desc="Formatting conversations"
+        )
+        
+        # Apply filters
+        if 'max_length' in dataset_config:
+            max_length = dataset_config['max_length']
+            original_size = len(dataset)
+            dataset = dataset.filter(lambda x: len(x['text']) <= max_length)
+            print(f"🔍 Filtered by length: {original_size} → {len(dataset)}")
+        
+        # Take subset if specified
+        if 'subset_size' in dataset_config and dataset_config['subset_size'] > 0:
+            subset_size = min(dataset_config['subset_size'], len(dataset))
+            dataset = dataset.select(range(subset_size))
+            print(f"📋 Using subset: {subset_size} samples")
+        
+        print(f"✅ Final dataset size: {len(dataset)}")
+        
+        # Show sample
+        if len(dataset) > 0:
+            sample_text = dataset[0]['text']
+            print(f"📝 Sample text preview:\n{sample_text[:300]}{'...' if len(sample_text) > 300 else ''}")
+        
+        return dataset
+
+
+class ModelManager:
+    """Handle model loading and configuration"""
     
-    def get_training_config(self) -> Dict[str, Any]:
-        return self.config['training']
+    @staticmethod
+    def load_model_and_tokenizer(model_config: Dict[str, Any], hardware_config: Dict[str, Any]):
+        """Load model with quantization and LoRA"""
+        model_name = model_config['name']
+        print(f"🤖 Loading model: {model_name}")
+        
+        # Load base model
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=model_name,
+            max_seq_length=model_config.get('max_seq_length', 2048),
+            dtype=model_config.get('dtype', None),
+            load_in_4bit=model_config.get('load_in_4bit', True),
+            trust_remote_code=model_config.get('trust_remote_code', True),
+            use_cache=model_config.get('use_cache', False),
+            device_map=hardware_config.get('device_map', "auto"),
+        )
+        
+        # Add LoRA adapters
+        print("🔗 Adding LoRA adapters...")
+        lora_config = model_config.get('lora', {})
+        
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=lora_config.get('r', 16),
+            target_modules=lora_config.get('target_modules', [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj"
+            ]),
+            lora_alpha=lora_config.get('alpha', 16),
+            lora_dropout=lora_config.get('dropout', 0.0),
+            bias=lora_config.get('bias', "none"),
+            use_gradient_checkpointing=lora_config.get('gradient_checkpointing', "unsloth"),
+            random_state=lora_config.get('random_state', 42),
+            use_rslora=lora_config.get('use_rslora', False),
+            loftq_config=lora_config.get('loftq_config', None),
+        )
+        
+        return model, tokenizer
+
+
+class TrainingManager:
+    """Handle training configuration and execution"""
     
-    def get_dataset_config(self) -> Dict[str, Any]:
-        return self.config['dataset']
+    @staticmethod
+    def create_training_config(training_config: Dict[str, Any], model_config: Dict[str, Any], 
+                             output_dir: str) -> SFTConfig:
+        """Create optimized training configuration"""
+        
+        return SFTConfig(
+            # Core settings
+            per_device_train_batch_size=training_config.get('per_device_train_batch_size', 2),
+            gradient_accumulation_steps=training_config.get('gradient_accumulation_steps', 4),
+            num_train_epochs=training_config.get('num_train_epochs', 1),
+            max_steps=training_config.get('max_steps', -1),
+            learning_rate=training_config.get('learning_rate', 2e-4),
+            
+            # Memory optimization
+            gradient_checkpointing=training_config.get('gradient_checkpointing', True),
+            optim=training_config.get('optimizer', "adamw_8bit"),
+            
+            # Precision
+            bf16=training_config.get('bf16', True),
+            fp16=training_config.get('fp16', False),
+            
+            # Scheduling
+            warmup_steps=training_config.get('warmup_steps', 10),
+            warmup_ratio=training_config.get('warmup_ratio', 0.1),
+            lr_scheduler_type=training_config.get('lr_scheduler_type', "cosine"),
+            
+            # Logging and saving
+            logging_steps=training_config.get('logging_steps', 25),
+            logging_first_step=True,
+            output_dir=output_dir,
+            report_to=training_config.get('report_to', "none"),
+            
+            save_strategy=training_config.get('save_strategy', "steps"),
+            save_steps=training_config.get('save_steps', 250),
+            save_total_limit=training_config.get('save_total_limit', 3),
+            
+            # Dataset settings
+            dataset_text_field="text",
+            max_seq_length=model_config.get('max_seq_length', 2048),
+            packing=training_config.get('packing', False),
+            remove_unused_columns=True,
+            dataloader_pin_memory=False,
+            seed=training_config.get('seed', 42),
+        )
     
-    def get_hardware_config(self) -> Dict[str, Any]:
-        return self.config['hardware']
-    
-    def get_output_config(self) -> Dict[str, Any]:
-        return self.config['output']
+    @staticmethod
+    def create_trainer_with_callbacks(model, tokenizer, dataset, training_args, 
+                                    early_stop_config: EarlyStopConfig):
+        """Create trainer with smart callbacks"""
+        callbacks = []
+        
+        # Add early stopping callback
+        if any([
+            early_stop_config.enable_loss_early_stopping,
+            early_stop_config.target_loss,
+            early_stop_config.max_time_minutes,
+            early_stop_config.max_steps
+        ]):
+            callbacks.append(SmartEarlyStoppingCallback(early_stop_config))
+        
+        return SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=dataset,
+            args=training_args,
+            callbacks=callbacks,
+        )
+
 
 def setup_environment(hardware_config: Dict[str, Any]):
-    """Set up environment variables for optimal training"""
+    """Setup training environment"""
     env_vars = hardware_config.get('environment_variables', {})
-    
-    # Default environment variables
     default_env = {
-        'PYTORCH_CUDA_ALLOC_CONF': 'max_split_size_mb:128',
-        'CUDA_LAUNCH_BLOCKING': '1',
-        'TORCH_USE_CUDA_DSA': '1',
+        'PYTORCH_CUDA_ALLOC_CONF': 'max_split_size_mb:256',
         'TOKENIZERS_PARALLELISM': 'false'
     }
     
-    # Merge with user-defined env vars
     for key, value in {**default_env, **env_vars}.items():
         os.environ[key] = str(value)
 
-class LossBasedEarlyStoppingCallback:
-    """Custom callback for early stopping based on training loss trends"""
-    
-    def __init__(self, patience: int = 5, min_delta: float = 0.001, 
-                 min_steps: int = 100, check_interval: int = 10):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.min_steps = min_steps
-        self.check_interval = check_interval
-        self.loss_history: List[float] = []
-        self.best_loss = float('inf')
-        self.wait_count = 0
-        self.stopped_early = False
-    
-    def on_log(self, logs: Dict[str, float], step: int):
-        """Check if we should stop based on loss trends"""
-        if step < self.min_steps:
-            return False
-            
-        if 'loss' in logs and step % self.check_interval == 0:
-            current_loss = logs['loss']
-            self.loss_history.append(current_loss)
-            
-            # Keep only recent history
-            if len(self.loss_history) > self.patience * 2:
-                self.loss_history = self.loss_history[-self.patience * 2:]
-            
-            # Check for improvement
-            if current_loss < (self.best_loss - self.min_delta):
-                self.best_loss = current_loss
-                self.wait_count = 0
-                print(f"🔥 New best loss: {current_loss:.4f}")
-            else:
-                self.wait_count += 1
-                print(f"⏳ No improvement for {self.wait_count}/{self.patience} checks")
-            
-            # Stop if no improvement for too long
-            if self.wait_count >= self.patience:
-                print(f"\n🛑 Early stopping triggered!")
-                print(f"📊 Best loss: {self.best_loss:.4f}")
-                print(f"⏱️ No improvement for {self.patience} checks")
-                self.stopped_early = True
-                return True
-                
-        return False
 
-class SmartTrainingCallback:
-    """Advanced callback with multiple stopping conditions"""
-    
-    def __init__(self, config: Dict[str, Any]):
-        self.config = config
-        self.loss_callback = None
-        self.target_loss = config.get('target_loss', None)
-        self.max_time_minutes = config.get('max_time_minutes', None)
-        self.start_time = None
-        
-        # Initialize loss-based early stopping if configured
-        if config.get('enable_loss_early_stopping', False):
-            self.loss_callback = LossBasedEarlyStoppingCallback(
-                patience=config.get('early_stop_patience', 5),
-                min_delta=config.get('early_stop_min_delta', 0.001),
-                min_steps=config.get('early_stop_min_steps', 100),
-                check_interval=config.get('early_stop_check_interval', 10)
-            )
-    
-    def on_train_begin(self):
-        import time
-        self.start_time = time.time()
-        print("🚀 Smart training callback initialized")
-        if self.target_loss:
-            print(f"🎯 Target loss: {self.target_loss}")
-        if self.max_time_minutes:
-            print(f"⏰ Max training time: {self.max_time_minutes} minutes")
-    
-    def should_stop(self, logs: Dict[str, float], step: int) -> tuple[bool, str]:
-        """Check all stopping conditions"""
-        import time
-        
-        # Check target loss
-        if self.target_loss and 'loss' in logs:
-            if logs['loss'] <= self.target_loss:
-                return True, f"🎯 Target loss {self.target_loss} achieved! Current: {logs['loss']:.4f}"
-        
-        # Check time limit
-        if self.max_time_minutes and self.start_time:
-            elapsed_minutes = (time.time() - self.start_time) / 60
-            if elapsed_minutes >= self.max_time_minutes:
-                return True, f"⏰ Time limit reached: {elapsed_minutes:.1f}/{self.max_time_minutes} minutes"
-        
-        # Check loss-based early stopping
-        if self.loss_callback and self.loss_callback.on_log(logs, step):
-            return True, "📉 Loss-based early stopping triggered"
-        
-def print_gpu_memory(prefix: str = ""):
-    """Monitor GPU memory usage"""
+def print_system_info():
+    """Print system information"""
     if torch.cuda.is_available():
+        gpu_props = torch.cuda.get_device_properties(0)
         allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"{prefix}GPU Memory - Allocated: {allocated:.1f}GB, Reserved: {reserved:.1f}GB")
+        total = gpu_props.total_memory / 1024**3
+        print(f"🔧 GPU: {gpu_props.name}")
+        print(f"💾 VRAM: {allocated:.1f}GB / {total:.1f}GB")
+        print(f"🆓 Free: {total - allocated:.1f}GB")
 
-def formatting_prompts_func(examples, format_type: str = "chatml"):
-    """Format conversations for training with different formats"""
-    texts = []
-    
-    if format_type == "chatml":
-        for conversation in examples["messages"]:
-            text = ""
-            for message in conversation:
-                role = message["role"]
-                content = message["content"]
-                text += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-            texts.append(text)
-    
-    elif format_type == "alpaca":
-        for conversation in examples["messages"]:
-            # Assume first message is instruction, second is response
-            if len(conversation) >= 2:
-                instruction = conversation[0]["content"]
-                response = conversation[1]["content"]
-                text = f"### Instruction:\n{instruction}\n\n### Response:\n{response}\n"
-                texts.append(text)
-    
-    elif format_type == "simple_qa":
-        # For simple Q&A format
-        for conversation in examples.get("conversations", examples.get("messages", [])):
-            if isinstance(conversation, dict) and "question" in conversation and "answer" in conversation:
-                text = f"Question: {conversation['question']}\nAnswer: {conversation['answer']}\n"
-                texts.append(text)
-    
-    return {"text": texts}
 
-def load_and_prepare_model(model_config: Dict[str, Any], hardware_config: Dict[str, Any]):
-    """Load model with quantization and add LoRA adapters"""
-    print(f"Loading {model_config['name']}...")
+def test_model(model, tokenizer, test_prompts: List[str]):
+    """Test the trained model"""
+    if not test_prompts:
+        return
     
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_config['name'],
-        max_seq_length=model_config.get('max_seq_length', 2048),
-        dtype=model_config.get('dtype', None),
-        load_in_4bit=model_config.get('load_in_4bit', True),
-        trust_remote_code=model_config.get('trust_remote_code', True),
-        use_cache=model_config.get('use_cache', False),
-        device_map=hardware_config.get('device_map', "auto"),
-    )
-    
-    print("Adding LoRA adapters...")
-    lora_config = model_config.get('lora', {})
-    
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=lora_config.get('r', 16),
-        target_modules=lora_config.get('target_modules', [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj"
-        ]),
-        lora_alpha=lora_config.get('alpha', 16),
-        lora_dropout=lora_config.get('dropout', 0),
-        bias=lora_config.get('bias', "none"),
-        use_gradient_checkpointing=lora_config.get('gradient_checkpointing', "unsloth"),
-        random_state=lora_config.get('random_state', 42),
-        use_rslora=lora_config.get('use_rslora', False),
-        loftq_config=lora_config.get('loftq_config', None),
-    )
-    
-    return model, tokenizer
-
-def prepare_dataset(dataset_config: Dict[str, Any]):
-    """Load and format the dataset"""
-    dataset_path = dataset_config['path']
-    dataset_format = dataset_config.get('format', 'json')
-    
-    if dataset_format == 'json':
-        dataset = load_dataset("json", data_files=dataset_path)["train"]
-    elif dataset_format == 'jsonl':
-        dataset = load_dataset("json", data_files=dataset_path)["train"]
-    elif dataset_format == 'csv':
-        dataset = load_dataset("csv", data_files=dataset_path)["train"]
-    else:
-        raise ValueError(f"Unsupported dataset format: {dataset_format}")
-    
-    print(f"Dataset size: {len(dataset)}")
-    
-    # Apply formatting to dataset
-    format_type = dataset_config.get('conversation_format', 'chatml')
-    dataset = dataset.map(
-        lambda examples: formatting_prompts_func(examples, format_type), 
-        batched=True
-    )
-    
-    # Apply any filtering if specified
-    if 'max_length' in dataset_config:
-        max_length = dataset_config['max_length']
-        dataset = dataset.filter(lambda example: len(example['text']) <= max_length)
-    
-    # Take subset if specified
-    if 'subset_size' in dataset_config and dataset_config['subset_size'] > 0:
-        subset_size = min(dataset_config['subset_size'], len(dataset))
-        dataset = dataset.select(range(subset_size))
-        print(f"Using subset of {subset_size} samples")
-    
-    # Verify the formatting worked
-    print("Formatted sample:")
-    print(dataset[0]["text"][:500] + "..." if len(dataset[0]["text"]) > 500 else dataset[0]["text"])
-    
-    return dataset
-
-def create_training_config(training_config: Dict[str, Any], model_config: Dict[str, Any], 
-                          output_dir: str) -> SFTConfig:
-    """Create training configuration"""
-    
-    # Extract training parameters with defaults and ensure proper types
-    batch_size = int(training_config.get('per_device_train_batch_size', 2))
-    gradient_accumulation_steps = int(training_config.get('gradient_accumulation_steps', 4))
-    num_epochs = int(training_config.get('num_train_epochs', 1))
-    learning_rate = float(training_config.get('learning_rate', 2e-4))
-    max_seq_length = int(model_config.get('max_seq_length', 2048))
-    
-    return SFTConfig(
-        # Basic settings
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=gradient_accumulation_steps,
-        num_train_epochs=num_epochs,
-        learning_rate=learning_rate,
-        
-        # Memory optimization
-        gradient_checkpointing=training_config.get('gradient_checkpointing', True),
-        gradient_checkpointing_kwargs=training_config.get('gradient_checkpointing_kwargs', 
-                                                        {"use_reentrant": False}),
-        optim=training_config.get('optimizer', "adamw_8bit"),
-        
-        # Precision settings
-        bf16=training_config.get('bf16', True),
-        fp16=training_config.get('fp16', False),
-        
-        # Logging
-        logging_steps=int(training_config.get('logging_steps', 10)),
-        logging_first_step=bool(training_config.get('logging_first_step', True)),
-        output_dir=output_dir,
-        report_to=training_config.get('report_to', "none"),
-        
-        # Scheduler settings
-        warmup_steps=int(training_config.get('warmup_steps', 10)),
-        warmup_ratio=float(training_config.get('warmup_ratio', 0.1)),
-        lr_scheduler_type=training_config.get('lr_scheduler_type', "linear"),
-        
-        # Save settings
-        save_strategy=training_config.get('save_strategy', "epoch"),
-        save_total_limit=int(training_config.get('save_total_limit', 2)),
-        save_steps=int(training_config.get('save_steps', 500)),
-        
-        # Dataset settings
-        dataset_text_field="text",
-        max_seq_length=max_seq_length,
-        packing=training_config.get('packing', False),
-        dataloader_pin_memory=training_config.get('dataloader_pin_memory', False),
-        remove_unused_columns=training_config.get('remove_unused_columns', True),
-        seed=training_config.get('seed', 42),
-        
-        # Additional optimizations
-        dataset_num_proc=int(training_config.get('dataset_num_proc', 2)),
-        per_device_eval_batch_size=int(training_config.get('per_device_eval_batch_size', batch_size)),
-    )
-
-def test_model(model, tokenizer, test_prompts: list):
-    """Test the trained model with sample prompts"""
-    print("\n🧪 Testing the model...")
-    
-    # Enable inference mode
+    print("\n🧪 Testing the trained model...")
     FastLanguageModel.for_inference(model)
     
-    for i, prompt in enumerate(test_prompts[:3]):  # Test first 3 prompts
-        print(f"\n--- Test {i+1} ---")
+    for i, prompt in enumerate(test_prompts[:2], 1):
+        print(f"\n--- Test {i} ---")
         print(f"Prompt: {prompt}")
         
-        messages = [{"role": "user", "content": prompt}]
-        
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt"
-        ).to("cuda")
-        
-        # Generate
-        outputs = model.generate(
-            input_ids=inputs,
-            max_new_tokens=256,
-            temperature=0.7,
-            top_p=0.9,
-            do_sample=True,
-        )
-        
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"Response: {response}")
+        try:
+            messages = [{"role": "user", "content": prompt}]
+            inputs = tokenizer.apply_chat_template(
+                messages, tokenize=True, add_generation_prompt=True, return_tensors="pt"
+            ).to(model.device)
+            
+            with torch.no_grad():
+                outputs = model.generate(
+                    inputs, max_new_tokens=200, temperature=0.7, 
+                    top_p=0.9, do_sample=True, pad_token_id=tokenizer.eos_token_id
+                )
+            
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Extract just the response part
+            if "<|im_start|>assistant" in response:
+                response = response.split("<|im_start|>assistant")[-1].strip()
+            print(f"Response: {response}")
+            
+        except Exception as e:
+            print(f"Test failed: {e}")
 
-def save_model(model, tokenizer, output_config: Dict[str, Any], output_dir: str):
-    """Save the trained model in specified format"""
-    save_method = output_config.get('save_method', 'merged_16bit')
-    
-    print(f"\nSaving model using method: {save_method}")
-    
-    if save_method in ['merged_16bit', 'merged_4bit', 'lora']:
-        model.save_pretrained_merged(
-            output_dir, 
-            tokenizer,
-            save_method=save_method,
-        )
-    else:
-        # Fallback to standard save
-        model.save_pretrained(output_dir)
-        tokenizer.save_pretrained(output_dir)
-    
-    print(f"✅ Model saved to {output_dir}")
 
 def main():
     """Main training function"""
-    parser = argparse.ArgumentParser(description="Dynamic Fine-tuning with YAML config")
-    parser.add_argument("--config", "-c", type=str, required=True, 
-                       help="Path to YAML configuration file")
-    parser.add_argument("--output-dir", "-o", type=str, 
-                       help="Output directory (overrides config)")
+    parser = argparse.ArgumentParser(description="Advanced Fine-tuning with Smart Early Stopping")
+    parser.add_argument("--config", "-c", type=str, required=True, help="YAML configuration file")
+    parser.add_argument("--output-dir", "-o", type=str, help="Override output directory")
+    parser.add_argument("--dry-run", action="store_true", help="Validate config without training")
     args = parser.parse_args()
     
-    # Load configuration
-    config_manager = FineTuningConfig(args.config)
-    
-    # Get configurations
-    model_config = config_manager.get_model_config()
-    training_config = config_manager.get_training_config()
-    dataset_config = config_manager.get_dataset_config()
-    hardware_config = config_manager.get_hardware_config()
-    output_config = config_manager.get_output_config()
-    
-    # Set output directory
-    output_dir = args.output_dir or output_config.get('directory', './finetuned-model')
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Setup environment
-    setup_environment(hardware_config)
+    # Initialize graceful shutdown handler
+    killer = GracefulKiller()
     
     try:
-        print("🚀 Starting dynamic fine-tuning...")
+        # Load and validate configuration
+        print("📋 Loading configuration...")
+        config_manager = ConfigManager(args.config)
+        config = config_manager.config
+        
+        # Extract configurations
+        model_config = config['model']
+        training_config = config['training']
+        dataset_config = config['dataset']
+        hardware_config = config.get('hardware', {})
+        output_config = config['output']
+        smart_training_config = config.get('smart_training', {})
+        
+        # Setup environment
+        setup_environment(hardware_config)
+        
+        # Set output directory
+        output_dir = args.output_dir or output_config.get('directory', './trained-model')
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        
+        print(f"🚀 Starting advanced fine-tuning")
         print(f"📊 Config: {args.config}")
         print(f"📁 Output: {output_dir}")
-        print(f"🔧 Model: {model_config['name']}")
+        print(f"🤖 Model: {model_config['name']}")
         print(f"📚 Dataset: {dataset_config['path']}")
         
-        # Load and prepare model
-        model, tokenizer = load_and_prepare_model(model_config, hardware_config)
+        if args.dry_run:
+            print("✅ Configuration validation passed!")
+            return
+        
+        # Load model and tokenizer
+        model, tokenizer = ModelManager.load_model_and_tokenizer(model_config, hardware_config)
         
         # Prepare dataset
-        dataset = prepare_dataset(dataset_config)
+        dataset = DatasetManager.load_and_prepare_dataset(dataset_config)
         
-        # Clear memory before training
+        # Clear memory
         torch.cuda.empty_cache()
         gc.collect()
-        print_gpu_memory("Before training - ")
+        print_system_info()
         
         # Create training configuration
-        training_args = create_training_config(training_config, model_config, output_dir)
+        training_args = TrainingManager.create_training_config(
+            training_config, model_config, output_dir
+        )
         
-        # Clear memory again
-        torch.cuda.empty_cache()
-        gc.collect()
+        # Setup early stopping
+        early_stop_config = EarlyStopConfig(
+            enable_loss_early_stopping=smart_training_config.get('enable_loss_early_stopping', False),
+            patience=smart_training_config.get('early_stop_patience', 5),
+            min_delta=smart_training_config.get('early_stop_min_delta', 0.001),
+            min_steps=smart_training_config.get('early_stop_min_steps', 100),
+            check_interval=smart_training_config.get('early_stop_check_interval', 10),
+            target_loss=smart_training_config.get('target_loss'),
+            max_time_minutes=smart_training_config.get('max_time_minutes'),
+            max_steps=smart_training_config.get('max_steps')
+        )
         
-        # Get smart training config
-        smart_config = config_manager.config.get('smart_training', {})
+        # Create trainer
+        trainer = TrainingManager.create_trainer_with_callbacks(
+            model, tokenizer, dataset, training_args, early_stop_config
+        )
         
-        # Create smart trainer with early stopping capabilities
-        trainer = create_smart_trainer(model, tokenizer, dataset, training_args, smart_config)
-        
-def create_smart_trainer(model, tokenizer, dataset, training_args, smart_config: Dict[str, Any]):
-    """Create trainer with smart early stopping capabilities"""
-    
-    # Initialize callbacks
-    callbacks = []
-    smart_callback = SmartTrainingCallback(smart_config)
-    
-    # Add HuggingFace early stopping if evaluation is enabled
-    if smart_config.get('enable_eval_early_stopping', False):
-        callbacks.append(EarlyStoppingCallback(
-            early_stopping_patience=smart_config.get('eval_early_stop_patience', 3),
-            early_stopping_threshold=smart_config.get('eval_early_stop_threshold', 0.001)
-        ))
-    
-    # Create custom trainer class with smart stopping
-    class SmartSFTTrainer(SFTTrainer):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.smart_callback = smart_callback
-            self.smart_callback.on_train_begin()
-        
-        def log(self, logs: Dict[str, float]) -> None:
-            """Override log method to check stopping conditions"""
-            super().log(logs)
-            
-            # Check if we should stop
-            should_stop, reason = self.smart_callback.should_stop(logs, self.state.global_step)
-            if should_stop:
-                print(f"\n{reason}")
-                print("💾 Saving model before stopping...")
-                self.save_model()
-                print("✅ Model saved successfully")
-                self.control.should_training_stop = True
-    
-    # Create the smart trainer
-    trainer = SmartSFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=dataset,
-        args=training_args,
-        callbacks=callbacks,
-        dataset_num_proc=smart_config.get('dataset_num_proc', 2),
-    )
-    
-    return trainer
-        
-        # Print GPU stats
-        if torch.cuda.is_available():
-            gpu_stats = torch.cuda.get_device_properties(0)
-            print(f"🔧 GPU: {gpu_stats.name}")
-            print(f"💾 Total Memory: {gpu_stats.total_memory / 1024**3:.1f} GB")
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            print(f"📊 Allocated before training: {allocated:.2f} GB")
-            print(f"🆓 Free memory: {(gpu_stats.total_memory / 1024**3) - allocated:.2f} GB")
-        
-        # Train the model with early stopping handling
+        # Start training
         print("\n🏋️ Training started...")
-        print("💡 Press Ctrl+C to stop training early and save the model")
+        print("💡 Press Ctrl+C for graceful shutdown")
+        
+        start_time = time.time()
+        trainer_stats = None
         
         try:
+            # Training loop with graceful shutdown check
             trainer_stats = trainer.train()
+            
         except KeyboardInterrupt:
             print("\n🛑 Training interrupted by user")
-            print("💾 Saving model at current checkpoint...")
-            trainer.save_model()
-            trainer_stats = None
+            
+        # Check for graceful killer
+        if killer.kill_now:
+            print("\n🛑 Graceful shutdown requested")
         
-        print("\n✅ Training complete!")
+        # Always try to save the model
+        print("\n💾 Saving model...")
+        try:
+            save_method = output_config.get('save_method', 'merged_16bit')
+            if save_method in ['merged_16bit', 'merged_4bit', 'lora']:
+                model.save_pretrained_merged(output_dir, tokenizer, save_method=save_method)
+            else:
+                trainer.save_model()
+            print(f"✅ Model saved to {output_dir}")
+        except Exception as e:
+            print(f"⚠️ Save error: {e}")
+            trainer.save_model()  # Fallback
+        
+        # Print training summary
+        elapsed_time = (time.time() - start_time) / 60
+        print(f"\n📊 Training Summary:")
+        print(f"⏱️ Training time: {elapsed_time:.1f} minutes")
+        
         if trainer_stats and hasattr(trainer_stats, 'training_loss'):
             print(f"📉 Final loss: {trainer_stats.training_loss:.4f}")
-        else:
-            print("📊 Training was stopped early")
         
-        # Save the model
-        save_model(model, tokenizer, output_config, output_dir)
-        
-        # Test the model if test prompts are provided
+        # Test the model
         test_prompts = output_config.get('test_prompts', [])
         if test_prompts:
             test_model(model, tokenizer, test_prompts)
         
-        # Save training config for reference
+        # Save configuration for reference
         config_save_path = Path(output_dir) / "training_config.yaml"
         with open(config_save_path, 'w') as f:
-            yaml.dump(config_manager.config, f, default_flow_style=False, indent=2)
-        print(f"📋 Training config saved to {config_save_path}")
+            yaml.dump(config, f, default_flow_style=False, indent=2)
+        print(f"📋 Config saved to {config_save_path}")
         
-    except torch.cuda.OutOfMemoryError as e:
-        print(f"\n❌ Out of memory error!")
-        print_gpu_memory("OOM Error - ")
-        print("\n💡 Memory-saving suggestions:")
-        print("1. Reduce per_device_train_batch_size")
-        print("2. Increase gradient_accumulation_steps") 
-        print("3. Reduce max_seq_length")
-        print("4. Enable packing in training config")
-        print("5. Reduce LoRA rank (r parameter)")
-        print("6. Use smaller model variant")
+        print("\n🎉 Fine-tuning completed successfully!")
+        
+    except KeyboardInterrupt:
+        print("\n🛑 Training interrupted")
+        sys.exit(0)
+        
+    except torch.cuda.OutOfMemoryError:
+        print("\n❌ GPU Out of Memory!")
+        print("💡 Suggestions:")
+        print("  - Reduce batch_size")
+        print("  - Increase gradient_accumulation_steps")
+        print("  - Reduce max_seq_length")
+        print("  - Use smaller model")
         torch.cuda.empty_cache()
-        raise
-
+        sys.exit(1)
+        
     except Exception as e:
-        print(f"\n❌ Training error: {e}")
+        print(f"\n❌ Error: {e}")
         traceback.print_exc()
-        raise
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
