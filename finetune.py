@@ -11,7 +11,8 @@ import argparse
 import torch
 import traceback
 from pathlib import Path
-from typing import Dict, Any, Optional
+from transformers import EarlyStoppingCallback
+from typing import Dict, Any, Optional, List
 from unsloth import FastLanguageModel
 from trl import SFTTrainer, SFTConfig
 from datasets import load_dataset
@@ -23,11 +24,64 @@ class FineTuningConfig:
         self.config_path = config_path
         self.config = self.load_config()
         self.validate_config()
+        self.convert_types()
     
     def load_config(self) -> Dict[str, Any]:
         """Load configuration from YAML file"""
         with open(self.config_path, 'r') as f:
             return yaml.safe_load(f)
+    
+    def convert_types(self):
+        """Convert string values to appropriate types"""
+        # Convert common numeric fields that might be strings
+        training = self.config.get('training', {})
+        
+        # Convert learning rate and other float fields
+        float_fields = ['learning_rate', 'warmup_ratio']
+        for field in float_fields:
+            if field in training and isinstance(training[field], str):
+                try:
+                    training[field] = float(training[field])
+                except ValueError:
+                    pass
+        
+        # Convert integer fields
+        int_fields = ['per_device_train_batch_size', 'gradient_accumulation_steps', 
+                     'num_train_epochs', 'logging_steps', 'warmup_steps', 
+                     'save_total_limit', 'save_steps', 'dataset_num_proc']
+        for field in int_fields:
+            if field in training and isinstance(training[field], str):
+                try:
+                    training[field] = int(training[field])
+                except ValueError:
+                    pass
+        
+        # Convert model fields
+        model = self.config.get('model', {})
+        model_int_fields = ['max_seq_length']
+        for field in model_int_fields:
+            if field in model and isinstance(model[field], str):
+                try:
+                    model[field] = int(model[field])
+                except ValueError:
+                    pass
+        
+        # Convert LoRA fields
+        lora = model.get('lora', {})
+        lora_int_fields = ['r', 'alpha', 'random_state']
+        lora_float_fields = ['dropout']
+        for field in lora_int_fields:
+            if field in lora and isinstance(lora[field], str):
+                try:
+                    lora[field] = int(lora[field])
+                except ValueError:
+                    pass
+        for field in lora_float_fields:
+            if field in lora and isinstance(lora[field], str):
+                try:
+                    lora[field] = float(lora[field])
+                except ValueError:
+                    pass
     
     def validate_config(self):
         """Validate required configuration keys"""
@@ -67,6 +121,99 @@ def setup_environment(hardware_config: Dict[str, Any]):
     for key, value in {**default_env, **env_vars}.items():
         os.environ[key] = str(value)
 
+class LossBasedEarlyStoppingCallback:
+    """Custom callback for early stopping based on training loss trends"""
+    
+    def __init__(self, patience: int = 5, min_delta: float = 0.001, 
+                 min_steps: int = 100, check_interval: int = 10):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.min_steps = min_steps
+        self.check_interval = check_interval
+        self.loss_history: List[float] = []
+        self.best_loss = float('inf')
+        self.wait_count = 0
+        self.stopped_early = False
+    
+    def on_log(self, logs: Dict[str, float], step: int):
+        """Check if we should stop based on loss trends"""
+        if step < self.min_steps:
+            return False
+            
+        if 'loss' in logs and step % self.check_interval == 0:
+            current_loss = logs['loss']
+            self.loss_history.append(current_loss)
+            
+            # Keep only recent history
+            if len(self.loss_history) > self.patience * 2:
+                self.loss_history = self.loss_history[-self.patience * 2:]
+            
+            # Check for improvement
+            if current_loss < (self.best_loss - self.min_delta):
+                self.best_loss = current_loss
+                self.wait_count = 0
+                print(f"🔥 New best loss: {current_loss:.4f}")
+            else:
+                self.wait_count += 1
+                print(f"⏳ No improvement for {self.wait_count}/{self.patience} checks")
+            
+            # Stop if no improvement for too long
+            if self.wait_count >= self.patience:
+                print(f"\n🛑 Early stopping triggered!")
+                print(f"📊 Best loss: {self.best_loss:.4f}")
+                print(f"⏱️ No improvement for {self.patience} checks")
+                self.stopped_early = True
+                return True
+                
+        return False
+
+class SmartTrainingCallback:
+    """Advanced callback with multiple stopping conditions"""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.loss_callback = None
+        self.target_loss = config.get('target_loss', None)
+        self.max_time_minutes = config.get('max_time_minutes', None)
+        self.start_time = None
+        
+        # Initialize loss-based early stopping if configured
+        if config.get('enable_loss_early_stopping', False):
+            self.loss_callback = LossBasedEarlyStoppingCallback(
+                patience=config.get('early_stop_patience', 5),
+                min_delta=config.get('early_stop_min_delta', 0.001),
+                min_steps=config.get('early_stop_min_steps', 100),
+                check_interval=config.get('early_stop_check_interval', 10)
+            )
+    
+    def on_train_begin(self):
+        import time
+        self.start_time = time.time()
+        print("🚀 Smart training callback initialized")
+        if self.target_loss:
+            print(f"🎯 Target loss: {self.target_loss}")
+        if self.max_time_minutes:
+            print(f"⏰ Max training time: {self.max_time_minutes} minutes")
+    
+    def should_stop(self, logs: Dict[str, float], step: int) -> tuple[bool, str]:
+        """Check all stopping conditions"""
+        import time
+        
+        # Check target loss
+        if self.target_loss and 'loss' in logs:
+            if logs['loss'] <= self.target_loss:
+                return True, f"🎯 Target loss {self.target_loss} achieved! Current: {logs['loss']:.4f}"
+        
+        # Check time limit
+        if self.max_time_minutes and self.start_time:
+            elapsed_minutes = (time.time() - self.start_time) / 60
+            if elapsed_minutes >= self.max_time_minutes:
+                return True, f"⏰ Time limit reached: {elapsed_minutes:.1f}/{self.max_time_minutes} minutes"
+        
+        # Check loss-based early stopping
+        if self.loss_callback and self.loss_callback.on_log(logs, step):
+            return True, "📉 Loss-based early stopping triggered"
+        
 def print_gpu_memory(prefix: str = ""):
     """Monitor GPU memory usage"""
     if torch.cuda.is_available():
@@ -184,12 +331,12 @@ def create_training_config(training_config: Dict[str, Any], model_config: Dict[s
                           output_dir: str) -> SFTConfig:
     """Create training configuration"""
     
-    # Extract training parameters with defaults
-    batch_size = training_config.get('per_device_train_batch_size', 2)
-    gradient_accumulation_steps = training_config.get('gradient_accumulation_steps', 4)
-    num_epochs = training_config.get('num_train_epochs', 1)
-    learning_rate = training_config.get('learning_rate', 2e-4)
-    max_seq_length = model_config.get('max_seq_length', 2048)
+    # Extract training parameters with defaults and ensure proper types
+    batch_size = int(training_config.get('per_device_train_batch_size', 2))
+    gradient_accumulation_steps = int(training_config.get('gradient_accumulation_steps', 4))
+    num_epochs = int(training_config.get('num_train_epochs', 1))
+    learning_rate = float(training_config.get('learning_rate', 2e-4))
+    max_seq_length = int(model_config.get('max_seq_length', 2048))
     
     return SFTConfig(
         # Basic settings
@@ -209,20 +356,20 @@ def create_training_config(training_config: Dict[str, Any], model_config: Dict[s
         fp16=training_config.get('fp16', False),
         
         # Logging
-        logging_steps=training_config.get('logging_steps', 10),
-        logging_first_step=training_config.get('logging_first_step', True),
+        logging_steps=int(training_config.get('logging_steps', 10)),
+        logging_first_step=bool(training_config.get('logging_first_step', True)),
         output_dir=output_dir,
         report_to=training_config.get('report_to', "none"),
         
         # Scheduler settings
-        warmup_steps=training_config.get('warmup_steps', 10),
-        warmup_ratio=training_config.get('warmup_ratio', 0.1),
+        warmup_steps=int(training_config.get('warmup_steps', 10)),
+        warmup_ratio=float(training_config.get('warmup_ratio', 0.1)),
         lr_scheduler_type=training_config.get('lr_scheduler_type', "linear"),
         
         # Save settings
         save_strategy=training_config.get('save_strategy', "epoch"),
-        save_total_limit=training_config.get('save_total_limit', 2),
-        save_steps=training_config.get('save_steps', 500),
+        save_total_limit=int(training_config.get('save_total_limit', 2)),
+        save_steps=int(training_config.get('save_steps', 500)),
         
         # Dataset settings
         dataset_text_field="text",
@@ -233,8 +380,8 @@ def create_training_config(training_config: Dict[str, Any], model_config: Dict[s
         seed=training_config.get('seed', 42),
         
         # Additional optimizations
-        dataset_num_proc=training_config.get('dataset_num_proc', 2),
-        per_device_eval_batch_size=training_config.get('per_device_eval_batch_size', batch_size),
+        dataset_num_proc=int(training_config.get('dataset_num_proc', 2)),
+        per_device_eval_batch_size=int(training_config.get('per_device_eval_batch_size', batch_size)),
     )
 
 def test_model(model, tokenizer, test_prompts: list):
@@ -339,14 +486,57 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()
         
-        # Create trainer
-        trainer = SFTTrainer(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=dataset,
-            args=training_args,
-            dataset_num_proc=training_config.get('dataset_num_proc', 2),
-        )
+        # Get smart training config
+        smart_config = config_manager.config.get('smart_training', {})
+        
+        # Create smart trainer with early stopping capabilities
+        trainer = create_smart_trainer(model, tokenizer, dataset, training_args, smart_config)
+        
+def create_smart_trainer(model, tokenizer, dataset, training_args, smart_config: Dict[str, Any]):
+    """Create trainer with smart early stopping capabilities"""
+    
+    # Initialize callbacks
+    callbacks = []
+    smart_callback = SmartTrainingCallback(smart_config)
+    
+    # Add HuggingFace early stopping if evaluation is enabled
+    if smart_config.get('enable_eval_early_stopping', False):
+        callbacks.append(EarlyStoppingCallback(
+            early_stopping_patience=smart_config.get('eval_early_stop_patience', 3),
+            early_stopping_threshold=smart_config.get('eval_early_stop_threshold', 0.001)
+        ))
+    
+    # Create custom trainer class with smart stopping
+    class SmartSFTTrainer(SFTTrainer):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.smart_callback = smart_callback
+            self.smart_callback.on_train_begin()
+        
+        def log(self, logs: Dict[str, float]) -> None:
+            """Override log method to check stopping conditions"""
+            super().log(logs)
+            
+            # Check if we should stop
+            should_stop, reason = self.smart_callback.should_stop(logs, self.state.global_step)
+            if should_stop:
+                print(f"\n{reason}")
+                print("💾 Saving model before stopping...")
+                self.save_model()
+                print("✅ Model saved successfully")
+                self.control.should_training_stop = True
+    
+    # Create the smart trainer
+    trainer = SmartSFTTrainer(
+        model=model,
+        tokenizer=tokenizer,
+        train_dataset=dataset,
+        args=training_args,
+        callbacks=callbacks,
+        dataset_num_proc=smart_config.get('dataset_num_proc', 2),
+    )
+    
+    return trainer
         
         # Print GPU stats
         if torch.cuda.is_available():
@@ -357,13 +547,23 @@ def main():
             print(f"📊 Allocated before training: {allocated:.2f} GB")
             print(f"🆓 Free memory: {(gpu_stats.total_memory / 1024**3) - allocated:.2f} GB")
         
-        # Train the model
+        # Train the model with early stopping handling
         print("\n🏋️ Training started...")
-        trainer_stats = trainer.train()
+        print("💡 Press Ctrl+C to stop training early and save the model")
+        
+        try:
+            trainer_stats = trainer.train()
+        except KeyboardInterrupt:
+            print("\n🛑 Training interrupted by user")
+            print("💾 Saving model at current checkpoint...")
+            trainer.save_model()
+            trainer_stats = None
         
         print("\n✅ Training complete!")
-        if hasattr(trainer_stats, 'training_loss'):
+        if trainer_stats and hasattr(trainer_stats, 'training_loss'):
             print(f"📉 Final loss: {trainer_stats.training_loss:.4f}")
+        else:
+            print("📊 Training was stopped early")
         
         # Save the model
         save_model(model, tokenizer, output_config, output_dir)

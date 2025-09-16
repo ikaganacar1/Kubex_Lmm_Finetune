@@ -2,7 +2,7 @@
 # This config is optimized for your specific hardware and dataset size
 
 model:
-  name: "unsloth/Qwen3-8B-unsloth-bnb-4bit"  # Good balance of capability and memory usage
+  name: "unsloth/Qwen2.5-7B-bnb-4bit"  # Good balance of capability and memory usage
   max_seq_length: 2048  # Good for Kubernetes documentation/code
   dtype: null  # Auto-detect
   load_in_4bit: true  # Essential for 24GB GPU
@@ -24,10 +24,10 @@ model:
     loftq_config: null
 
 training:
-  per_device_train_batch_size: 2  # Optimized for 24GB
+  per_device_train_batch_size: 4  # Optimized for 24GB
   gradient_accumulation_steps: 4  # Effective batch size of 16
-  num_train_epochs: 1  # Multiple epochs for 25k samples
-  learning_rate: 5e-4  # Slightly lower for stability
+  num_train_epochs: 3  # Multiple epochs for 25k samples
+  learning_rate: 0.0001  # 1e-4 - Slightly lower for stability
   
   # Memory optimizations
   gradient_checkpointing: true
@@ -52,7 +52,13 @@ training:
   save_strategy: "steps"
   save_steps: 500
   save_total_limit: 3
-  eval_strategy: "no"  # Disable eval to save memory
+  # Early stopping (optional)
+  eval_strategy: "steps"
+  eval_steps: 200
+  load_best_model_at_end: true
+  metric_for_best_model: "eval_loss"
+  greater_is_better: false
+  early_stopping_patience: 3  # Stop if no improvement for 3 evaluations
   
   # Dataset optimizations
   packing: false  # Better quality for Q&A format
