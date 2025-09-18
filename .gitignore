@@ -1,2 +1,4 @@
 *.jsonl
 *.json
+
+!DatasetPrep/Datasets/kubernetes-docs&codes-combined.jsonl
