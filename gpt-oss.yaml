@@ -49,7 +49,7 @@ training:
   seed: 42
 
 dataset:
-  path: "kubernetes_chatml.jsonl"
+  path: "kubernetes-docs_codes-combined.jsonl"
   format: "jsonl"
   conversation_format: "chatml"
   max_length: 4096
